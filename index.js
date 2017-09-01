@@ -1,11 +1,12 @@
 const miio = require('miio');
 const HKMiioVersion = require('./package.json').version;
 var Accessory, Service, Characteristic, UUIDGen;
-const SupportedTypes = {
+const SupportedTypes = { // These are ANY devices that could be added
   "outlet":true,
   "power-plug":true,
   "power-strip":true,
-  "power-switch":true
+  "power-switch":true,
+  "light":true
 };
 
 module.exports = function(homebridge) {
@@ -91,26 +92,33 @@ XiaomiMiio.prototype.pollDevices = function(looping) {
   loop(accessories);
 }
 
+
 // query a specific accessory for updated state
 XiaomiMiio.prototype.pollDevice = function(accessory, cb) {
-  let queries = [];
-  if (SupportedTypes[accessory.miioDevice.type]) queries = ["power"];
-  accessory.miioDevice.loadProperties(queries)
-  .then((props)=> {
-    accessory.updateReachability(true);
-    if (SupportedTypes[accessory.miioDevice.type]) {
-      accessory.context.powerOn = !!props.powerChannel0;
-      accessory.getService(Service.Outlet, "Power Plug")
-               .updateCharacteristic(Characteristic.On, !!props.powerChannel0);
-    } else {
-      this.log("Unsupported accessory is somehow in homebridge database");
-    }
-    if (cb) cb();
-  }).catch((err)=> {
-    accessory.updateReachability(false);
-    if (cb) cb(err);
-    else this.log("poll update failed on " + accessory.context.miioInfo.id, err);
-  });
+
+  device = accessory.miioDevice;
+
+  if (device.hasCapability('power-channels')){
+    device.loadProperties(['power']).then((prop)=>{
+      accessory.context.powerOn = !!prop.powerChannel0;
+      accessory.getService(Service.Outlet, "Power Plug").updateCharacteristic(Characteristic.On, !!prop.powerChannel0);
+    });
+  }
+
+  if (device.hasCapability('power')){
+    device.loadProperties(['power']).then((prop)=>{
+      accessory.context.Brightness = !!prop.power;
+      accessory.getService(Service.Lightbulb, "Light").updateCharacteristic(Characteristic.On, !!prop.power);
+    });
+  }
+
+  if (device.hasCapability('brightness')){
+    device.loadProperties(['brightness']).then((prop)=>{
+    accessory.context.Brightness = prop.brightness;
+    accessory.getService(Service.Lightbulb, "Light").updateCharacteristic(Characteristic.Brightness, prop.brightness );
+    });
+  }
+
 }
 
 // Function invoked when homebridge tries to restore cached accessory
@@ -135,28 +143,48 @@ XiaomiMiio.prototype.configureAccessory = function(accessory) {
 
   if (accessory.context.features.switchPlug) {
     var service = accessory.getService(Service.Outlet, "Power Plug") || accessory.addService(Service.Outlet, "Power Plug");
-    var charOn = service.getCharacteristic(Characteristic.On)
-    charOn.on('set', (value, callback)=> {
-      this.log(accessory.displayName, "power to " + value);
-      accessory.miioDevice.setPower(!!value).then(()=> {
-        accessory.context.powerOn = !!value;
+    service.updateCharacteristic(Characteristic.OutletInUse, true);
+  }
+
+  if (accessory.miioDevice.hasCapability('brightness')){
+    var service = accessory.getService(Service.Lightbulb, "Light") || accessory.addService(Service.Lightbulb, "Light");
+    var bright = service.getCharacteristic(Characteristic.Brightness)
+    bright.on('set', (value, callback)=> {
+      this.log(accessory.displayName, "brightness to " + value);
+      accessory.miioDevice.setBrightness(value).then(()=> {
+        accessory.context.Brightness = value;
         callback();
       }).catch((err)=> {
         callback("Communications Error", err);
       });
     })
-    charOn.on('get', (callback)=> {
+    bright.on('get', (callback)=> {
       this.log(accessory.displayName, "fetch status")
       // return polled value immediately:
-      callback(null, !!accessory.context.powerOn);
+      callback(null, accessory.context.Brightness);
       // pull update lazily:
       this.pollDevice(accessory);
     });
-    // we can't possibly know this, so we assume as best we can:
-    service.updateCharacteristic(Characteristic.OutletInUse, true);
-  } else {
-    this.log("Mysteriously there is a device in here which isn't a switch...", accessory.context.miioType);
   }
+
+ 
+  var charOn = service.getCharacteristic(Characteristic.On)
+  charOn.on('set', (value, callback)=> {
+    this.log(accessory.displayName, "power to " + value);
+    accessory.miioDevice.setPower(!!value).then(()=> {
+      accessory.context.powerOn = !!value;
+      callback();
+    }).catch((err)=> {
+      callback("Communications Error", err);
+    });
+  })
+  charOn.on('get', (callback)=> {
+    this.log(accessory.displayName, "fetch status")
+    // return polled value immediately:
+    callback(null, !!accessory.context.powerOn);
+    // pull update lazily:
+    this.pollDevice(accessory);
+  });
 }
 
 // check a newly detected accessory and make sure it's in the bridge
@@ -172,16 +200,20 @@ XiaomiMiio.prototype.addAccessory = function(miioInfo) {
   // communicate with device to figure out what type it is
   miioInfo.writeOnly = true;
   miio.device(miioInfo).catch(err => this.log("Couldn't investigate device", miioInfo, err))
-	.then((device)=> {
+  .then((device)=> {
     var uuid = UUIDGen.generate(`miio.${device.model}.${miioInfo.id}`);
     var isNew = !this.accessories[miioInfo.id]; // does it need registering?
 
     if (SupportedTypes[device.type]) {
       if (isNew) {
-        this.log("Miio Accessory is a switch plug. Adding to HomeKit");
-        this.accessories[miioInfo.id] = new Accessory(`miIO Plug ${miioInfo.id}`, uuid);
+        this.log("Miio Accessory is supported. Adding to HomeKit");
+        this.accessories[miioInfo.id] = new Accessory(`miIO Device ${miioInfo.id}`, uuid);
       }
-      this.accessories[miioInfo.id].context.features = {switchPlug: true};
+      if (device.type==='light'){
+        this.accessories[miioInfo.id].context.features = {light: true};
+      } else {
+        this.accessories[miioInfo.id].context.features = {switchPlug: true};
+      }
     } else {
       this.log("Unsupported, ignoring");
     }
@@ -205,5 +237,5 @@ XiaomiMiio.prototype.addAccessory = function(miioInfo) {
     } else {
       device.destroy();
     }
-	});
+  });
 }
